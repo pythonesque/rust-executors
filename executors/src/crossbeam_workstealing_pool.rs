@@ -193,6 +193,31 @@ where
     })
 }
 
+/// Try to run the future immediately on the thread-local job queue.
+///
+/// This only work if called from a thread that is part of the pool.
+/// Otherwise the thread will panic.
+///
+/// Returns the join handle of the task.
+pub fn run_locally<R: Send + 'static>(future: impl Future<Output = R> + 'static + Send) -> JoinHandle<R> {
+    let (task, handle) = async_task::spawn(future, move |task| {
+        LOCAL_JOB_QUEUE.with(|qo| unsafe {
+            match *qo.get() {
+                Some(ref q) => {
+                    let msg = Job::Task(task);
+                    q.push(msg);
+
+                    #[cfg(feature = "produce-metrics")]
+                    increment_gauge!("executors.jobs_queued", 1.0, "executor" => "crossbeam_workstealing_pool");
+                }
+                None => panic!("Jobs should be executed on the thread pool."),
+            }
+        })
+    });
+    task.run();
+    handle
+}
+
 /// A handle associated with the thread pool structure
 #[derive(Clone, Debug)]
 pub struct ThreadPool<P>
