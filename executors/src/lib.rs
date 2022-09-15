@@ -62,6 +62,8 @@
 extern crate log;
 
 pub mod bichannel;
+#[cfg(feature = "workstealing-exec")]
+pub mod builder;
 pub mod common;
 #[cfg(feature = "cb-channel-exec")]
 pub mod crossbeam_channel_pool;

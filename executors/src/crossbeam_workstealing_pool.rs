@@ -70,6 +70,7 @@ use crate::numa_utils::{equidistance, ProcessingUnitDistance};
 #[cfg(not(feature = "ws-no-park"))]
 use crate::parker::ParkResult;
 use crate::{
+    builder::{ThreadBuilder, ThreadPoolBuilder, ThreadSpawn},
     futures_executor::FuturesExecutor,
     parker,
     parker::{DynParker, Parker},
@@ -104,14 +105,14 @@ use std::{
 /// This a convenience function, which is equivalent to `ThreadPool::new(threads, parker::small())`.
 pub fn small_pool(threads: usize) -> ThreadPool<parker::StaticParker<parker::SmallThreadData>> {
     let p = parker::small();
-    ThreadPool::new(threads, p)
+    ThreadPoolBuilder::new().build(threads, p)
 }
 /// Creates a thread pool with support for up to 64 threads.
 ///
 /// This a convenience function, which is equivalent to `ThreadPool::new(threads, parker::large())`.
 pub fn large_pool(threads: usize) -> ThreadPool<parker::StaticParker<parker::LargeThreadData>> {
     let p = parker::large();
-    ThreadPool::new(threads, p)
+    ThreadPoolBuilder::new().build(threads, p)
 }
 
 /// Creates a thread pool with support for an arbitrary* number threads.
@@ -121,7 +122,7 @@ pub fn large_pool(threads: usize) -> ThreadPool<parker::StaticParker<parker::Lar
 /// This a convenience function, which is equivalent to `ThreadPool::new(threads, parker::dyamic())`.
 pub fn dyn_pool(threads: usize) -> ThreadPool<parker::StaticParker<parker::DynamicThreadData>> {
     let p = parker::dynamic();
-    ThreadPool::new(threads, p)
+    ThreadPoolBuilder::new().build(threads, p)
 }
 
 /// Creates a new thread pool capable of executing `threads` number of jobs concurrently.
@@ -147,13 +148,13 @@ pub fn dyn_pool(threads: usize) -> ThreadPool<parker::StaticParker<parker::Dynam
 pub fn pool_with_auto_parker(threads: usize) -> ThreadPool<DynParker> {
     if threads <= parker::SmallThreadData::MAX_THREADS {
         let p = parker::small().dynamic().unwrap();
-        ThreadPool::new(threads, p)
+        ThreadPoolBuilder::new().build(threads, p)
     } else if threads <= parker::LargeThreadData::MAX_THREADS {
         let p = parker::large().dynamic().unwrap();
-        ThreadPool::new(threads, p)
+        ThreadPoolBuilder::new().build(threads, p)
     } else {
         let p = parker::dynamic().dynamic().unwrap();
-        ThreadPool::new(threads, p)
+        ThreadPoolBuilder::new().build(threads, p)
     }
 }
 
@@ -224,11 +225,10 @@ pub struct ThreadPool<P>
 where
     P: Parker + Clone + 'static,
 {
-    inner: Arc<ThreadPoolInner<P>>,
+    inner: Arc<ThreadPoolInner<P, dyn ThreadSpawn<P> + Send + Sync>>,
 }
 
-#[derive(Debug)]
-struct ThreadPoolInner<P>
+struct ThreadPoolInner<P, B: ?Sized>
 where
     P: Parker + Clone + 'static,
 {
@@ -239,6 +239,23 @@ where
     parker: P,
     #[cfg(feature = "numa-aware")]
     pu_distance: ProcessingUnitDistance,
+    // start_handler: Option<Box<StartHandler>>,
+    builder: ThreadPoolBuilder<B>,
+}
+
+impl<P: Parker + Clone + Debug + 'static, B: ?Sized> Debug for ThreadPoolInner<P, B> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let mut build = f.debug_struct("ThreadPoolInner");
+        build
+            .field("core", &self.core)
+            .field("global_sender", &self.global_sender)
+            .field("threads", &self.threads)
+            .field("shutdown", &self.shutdown)
+            .field("parker", &self.parker);
+        #[cfg(feature = "numa-aware")]
+        build.field("pu_distance", &self.pu_distance);
+        build.finish()
+    }
 }
 
 #[derive(Debug)]
@@ -251,33 +268,7 @@ impl<P> ThreadPool<P>
 where
     P: Parker + Clone + 'static,
 {
-    /// Creates a new thread pool capable of executing `threads` number of jobs concurrently.
-    ///
-    /// Must supply a `parker` that can handle the requested number of threads.
-    ///
-    /// # Panics
-    ///
-    /// - This function will panic if `threads` is 0.
-    /// - It will also panic if `threads` is larger than the `ThreadData::MAX_THREADS` value of the provided `parker`.
-    ///
-    /// # Core Affinity
-    ///
-    /// If compiled with `thread-pinning` it will assign a worker to each cores,
-    /// until it runs out of cores or workers. If there are more workers than cores,
-    /// the extra workers will be "floating", i.e. not pinned.
-    ///
-    /// # Examples
-    ///
-    /// Create a new thread pool capable of executing four jobs concurrently:
-    ///
-    /// ```
-    /// use executors::*;
-    /// use executors::crossbeam_workstealing_pool::ThreadPool;
-    ///
-    /// let pool = ThreadPool::new(4, parker::small());
-    /// # pool.shutdown();
-    /// ```
-    pub fn new(threads: usize, parker: P) -> ThreadPool<P> {
+    pub(crate) fn new<S: ThreadSpawn<P> + Send + Sync + 'static>(builder: ThreadPoolBuilder<S>, threads: usize, parker: P) -> ThreadPool<P> {
         assert!(threads > 0);
         if let Some(max) = parker.max_threads() {
             assert!(threads <= max);
@@ -296,6 +287,7 @@ where
             parker,
             #[cfg(feature = "numa-aware")]
             pu_distance,
+            builder,
         };
         let pool = ThreadPool {
             inner: Arc::new(inner),
@@ -339,7 +331,7 @@ where
     /// - This function will panic if `cores.len() + floating` is greater than `parker.max_threads()`.
     /// - This function will panic if no core ids can be accessed.
     #[cfg(feature = "thread-pinning")]
-    pub fn with_affinity(cores: &[CoreId], floating: usize, parker: P) -> ThreadPool<P> {
+    pub(crate) fn with_affinity<S: ThreadSpawn<P> + Send + Sync + 'static>(builder: ThreadPoolBuilder<S>, cores: &[CoreId], floating: usize, parker: P) -> ThreadPool<P> {
         let total_threads = cores.len() + floating;
         assert!(total_threads > 0);
         if let Some(max) = parker.max_threads() {
@@ -359,6 +351,7 @@ where
             parker,
             #[cfg(feature = "numa-aware")]
             pu_distance,
+            builder,
         };
         let pool = ThreadPool {
             inner: Arc::new(inner),
@@ -377,21 +370,9 @@ where
         pool
     }
 
-    /// Creates a new thread pool capable of executing `threads` number of jobs concurrently with a particular core affinity.
-    ///
-    /// For each core id in the `core` slice, it will generate a single thread pinned to that id.
-    /// Additionally, it will create `floating` number of unpinned threads.
-    ///
-    /// Internally the stealers will use the provided PU distance matrix to prioritise stealing from
-    /// queues that are "closer" by, in order to try and reduce memory movement across caches and NUMA nodes.
-    ///
-    /// # Panics
-    ///
-    /// - This function will panic if `cores.len() + floating` is 0.
-    /// - This function will panic if `cores.len() + floating` is greater than `parker.max_threads()`.
-    /// - This function will panic if no core ids can be accessed.
     #[cfg(feature = "numa-aware")]
-    pub fn with_numa_affinity(
+    pub(crate) fn with_numa_affinity<S: ThreadSpawn<P> + Send + Sync + 'static>(
+        builder: ThreadPoolBuilder<S>,
         cores: &[CoreId],
         floating: usize,
         parker: P,
@@ -410,6 +391,7 @@ where
             shutdown: AtomicBool::new(false),
             parker,
             pu_distance,
+            builder,
         };
         let pool = ThreadPool {
             inner: Arc::new(inner),
@@ -462,7 +444,7 @@ where
 impl Default for ThreadPool<DynParker> {
     fn default() -> Self {
         let p = parker::dynamic().dynamic().unwrap();
-        ThreadPool::new(num_cpus::get(), p)
+        ThreadPool::new(ThreadPoolBuilder::new(), num_cpus::get(), p)
     }
 }
 
@@ -572,9 +554,10 @@ where
     }
 }
 
-impl<P> ThreadPoolInner<P>
+impl<P/*, B*/> ThreadPoolInner<P, dyn ThreadSpawn<P> + Send + Sync>
 where
     P: Parker + Clone + 'static,
+    // B: ThreadSpawn<P> + Sync + ?Sized,
 {
     fn spawn_worker(
         &self,
@@ -589,16 +572,21 @@ where
             stealer: Option::None,
         };
         guard.workers.insert(id, worker);
-        thread::Builder::new()
-            .name(format!("cb-ws-pool-worker-{}", id))
-            .spawn(move || {
-                #[cfg(feature = "thread-pinning")]
-                let mut worker = ThreadPoolWorker::new(id, rx_control, &inner, None);
-                #[cfg(not(feature = "thread-pinning"))]
-                let mut worker = ThreadPoolWorker::new(id, rx_control, &inner);
-                drop(inner);
-                worker.run()
-            })
+        // let inner: Arc<ThreadPoolInner<P, dyn ThreadSpawn<P> + Send + Sync>> = inner;
+        #[cfg(feature = "thread-pinning")]
+        let worker = ThreadPoolWorker::new(id, rx_control, &inner, None);
+        #[cfg(not(feature = "thread-pinning"))]
+        let worker = ThreadPoolWorker::new(id, rx_control, &inner);
+        let thread = ThreadBuilder {
+            name: inner.builder.get_thread_name(*worker.id()),
+            stack_size: inner.builder.get_stack_size(),
+            worker,
+        };
+        inner
+            .builder
+            .get_spawn_handler()
+            // .name(format!("cb-ws-pool-worker-{}", worker.id()))
+            .spawn(thread)
             .expect("Could not create worker thread!");
     }
 
@@ -617,19 +605,22 @@ where
             stealer: Option::None,
         };
         guard.workers.insert(id, worker);
-        thread::Builder::new()
-            .name(format!("cb-ws-pool-worker-{}", id))
-            .spawn(move || {
-                core_affinity::set_for_current(core_id);
-                let mut worker = ThreadPoolWorker::new(id, rx_control, &inner, Some(core_id));
-                drop(inner);
-                worker.run()
-            })
+        let worker = ThreadPoolWorker::new(id, rx_control, &inner, Some(core_id));
+        let thread = ThreadBuilder {
+            name: inner.builder.get_thread_name(*worker.id()),
+            stack_size: inner.builder.get_stack_size(),
+            worker,
+        };
+        inner
+            .builder
+            .get_spawn_handler()
+            // .name(format!("cb-ws-pool-worker-{}", worker.id()))
+            .spawn(thread)
             .expect("Could not create worker thread!");
     }
 }
 
-impl<P> Drop for ThreadPoolInner<P>
+impl<P, B: ?Sized> Drop for ThreadPoolInner<P, B>
 where
     P: Parker + Clone + 'static,
 {
@@ -724,15 +715,14 @@ impl CanExecute for ThreadLocalExecute {
 }
 
 #[derive(Debug)]
-struct ThreadPoolWorker<P>
+pub(crate) struct ThreadPoolWorker<P>
 where
     P: Parker + Clone + 'static,
 {
     id: usize,
-    core: Weak<ThreadPoolInner<P>>,
+    core: Weak<ThreadPoolInner<P, dyn ThreadSpawn<P> + Send + Sync>>,
     control: channel::Receiver<ControlMsg>,
     stealers: Vec<(i32, JobStealer)>,
-    random: ThreadRng,
     #[cfg(feature = "thread-pinning")]
     #[allow(dead_code)] // is used only for debugging
     core_id: Option<CoreId>,
@@ -745,7 +735,7 @@ where
     fn new(
         id: usize,
         control: channel::Receiver<ControlMsg>,
-        core: &Arc<ThreadPoolInner<P>>,
+        core: &Arc<ThreadPoolInner<P, dyn ThreadSpawn<P> + Send + Sync>>,
         #[cfg(feature = "thread-pinning")] core_id: Option<CoreId>,
     ) -> ThreadPoolWorker<P> {
         ThreadPoolWorker {
@@ -753,14 +743,13 @@ where
             core: Arc::downgrade(core),
             control,
             stealers: Vec::new(),
-            random: rand::thread_rng(),
             #[cfg(feature = "thread-pinning")]
             core_id,
         }
     }
 
     #[inline(always)]
-    fn id(&self) -> &usize {
+    pub(crate) fn id(&self) -> &usize {
         &self.id
     }
 
@@ -783,7 +772,7 @@ where
     #[cfg(not(feature = "ws-no-park"))]
     fn abort_sleep(
         &self,
-        core: &Arc<ThreadPoolInner<P>>,
+        core: &Arc<ThreadPoolInner<P, dyn ThreadSpawn<P> + Send + Sync>>,
         backoff: &Backoff,
         snoozing: &mut bool,
         parking: &mut bool,
@@ -808,10 +797,19 @@ where
         *parking = false;
     }
 
-    fn run(&mut self) {
+    pub(crate) fn run(&mut self) {
+        #[cfg(feature = "thread-pinning")]
+        if let Some(core_id) = self.core_id {
+            core_affinity::set_for_current(core_id);
+        }
+        let mut random = rand::thread_rng();
+
         debug!("Worker {} starting", self.id());
 
         let local_stealer_raw = LOCAL_JOB_QUEUE.with(|q| unsafe {
+            // Required for safety since we allow safe custom spawn handlers, so we don't know for
+            // sure that we're on a new thread.
+            assert!((*q.get()).is_none());
             let worker = deque::Worker::new_fifo();
             let stealer = worker.stealer();
             *q.get() = Some(worker);
@@ -827,7 +825,12 @@ where
         let local_stealer = JobStealer::new(local_stealer_raw, self.id);
         self.register_stealer(&core, local_stealer);
         core.parker.init(*self.id());
+        if let Some(handler) = core.builder.get_start_handler() {
+            handler(*self.id());
+        }
         drop(core);
+
+
         let sentinel = Sentinel::new(self.core.clone(), self.id);
         let backoff = Backoff::new();
         let mut snoozing = false;
@@ -891,9 +894,9 @@ where
                     Ok(msg) => match msg {
                         ControlMsg::Stealers(l) => {
                             #[cfg(feature = "numa-aware")]
-                            self.update_stealers(&core, l);
+                            self.update_stealers(&mut random, &*core, l);
                             #[cfg(not(feature = "numa-aware"))]
-                            self.update_stealers(l);
+                            self.update_stealers(&mut random, l);
 
                             #[cfg(feature = "ws-no-park")]
                             self.abort_sleep(&backoff, &mut snoozing, &mut failed_steal_attempts);
@@ -1019,26 +1022,26 @@ where
         }
     }
 
-    fn register_stealer(&mut self, core: &Arc<ThreadPoolInner<P>>, stealer: JobStealer) {
+    fn register_stealer(&mut self, core: &Arc<ThreadPoolInner<P, dyn ThreadSpawn<P> + Send + Sync>>, stealer: JobStealer) {
         let mut guard = core.core.lock().unwrap();
         guard.add_stealer(stealer);
     }
 
-    fn unregister_stealer(&mut self, core: &Arc<ThreadPoolInner<P>>) {
+    fn unregister_stealer(&mut self, core: &Arc<ThreadPoolInner<P, dyn ThreadSpawn<P> + Send + Sync>>) {
         let mut guard = core.core.lock().unwrap();
         guard.drop_worker(self.id);
     }
 
     #[cfg(not(feature = "numa-aware"))]
-    fn update_stealers(&mut self, v: Vec<JobStealer>) {
+    fn update_stealers(&mut self, random: &mut ThreadRng, v: Vec<JobStealer>) {
         let mut weighted: Vec<(i32, JobStealer)> =
             v.into_iter().map(|stealer| (0, stealer)).collect();
-        weighted.shuffle(&mut self.random);
+        weighted.shuffle(random);
         self.stealers = weighted;
     }
 
     #[cfg(feature = "numa-aware")]
-    fn update_stealers(&mut self, _core: &ThreadPoolInner<P>, v: Vec<JobStealer>) {
+    fn update_stealers(&mut self, random: &mut ThreadRng, _core: &ThreadPoolInner<P, dyn ThreadSpawn<P>>, v: Vec<JobStealer>) {
         let mut weighted: Vec<(i32, JobStealer)> = if let Some(my_id) = self.core_id {
             let distances = &_core.pu_distance;
             v.into_iter()
@@ -1054,7 +1057,7 @@ where
         } else {
             v.into_iter().map(|stealer| (0, stealer)).collect()
         };
-        weighted.shuffle(&mut self.random);
+        weighted.shuffle(random);
         weighted.sort_unstable_by_key(|(weight, _stealer)| *weight);
         self.stealers = weighted;
     }
@@ -1148,7 +1151,7 @@ struct Sentinel<P>
 where
     P: Parker + Clone + 'static,
 {
-    core: Weak<ThreadPoolInner<P>>,
+    core: Weak<ThreadPoolInner<P, dyn ThreadSpawn<P> + Send + Sync>>,
     id: usize,
     active: bool,
 }
@@ -1157,7 +1160,7 @@ impl<P> Sentinel<P>
 where
     P: Parker + Clone + 'static,
 {
-    fn new(core: Weak<ThreadPoolInner<P>>, id: usize) -> Sentinel<P> {
+    fn new(core: Weak<ThreadPoolInner<P, dyn ThreadSpawn<P> + Send + Sync>>, id: usize) -> Sentinel<P> {
         Sentinel {
             core,
             id,
@@ -1218,26 +1221,26 @@ mod tests {
 
     #[test]
     fn test_debug() {
-        let exec = ThreadPool::new(2, parker::small());
+        let exec = ThreadPoolBuilder::new().build(2, parker::small());
         crate::tests::test_debug(&exec, LABEL);
         exec.shutdown().expect("Pool didn't shut down!");
     }
 
     #[test]
     fn test_sleepy_small() {
-        let exec = ThreadPool::new(4, parker::small());
+        let exec = ThreadPoolBuilder::new().build(4, parker::small());
         crate::tests::test_sleepy(exec, LABEL);
     }
 
     #[test]
     fn test_sleepy_large() {
-        let exec = ThreadPool::new(36, parker::large());
+        let exec = ThreadPoolBuilder::new().build(36, parker::large());
         crate::tests::test_sleepy(exec, LABEL);
     }
 
     #[test]
     fn test_sleepy_dyn() {
-        let exec = ThreadPool::new(72, parker::dynamic());
+        let exec = ThreadPoolBuilder::new().build(72, parker::dynamic());
         crate::tests::test_sleepy(exec, LABEL);
     }
 
@@ -1308,7 +1311,7 @@ mod tests {
         let _ = env_logger::try_init();
 
         let latch = Arc::new(CountdownEvent::new(2));
-        let pool = ThreadPool::new(2, parker::small());
+        let pool = ThreadPoolBuilder::new().build(2, parker::small());
         let latch2 = latch.clone();
         let latch3 = latch.clone();
         pool.execute(move || {
@@ -1328,7 +1331,7 @@ mod tests {
         let _ = env_logger::try_init();
 
         let latch = Arc::new(CountdownEvent::new(4));
-        let pool = ThreadPool::new(2, parker::small());
+        let pool = ThreadPoolBuilder::new().build(2, parker::small());
         let pool2 = pool.clone();
         let pool3 = pool.clone();
         let latch2 = latch.clone();
@@ -1358,7 +1361,7 @@ mod tests {
         let _ = env_logger::try_init();
 
         let latch = Arc::new(CountdownEvent::new(2));
-        let pool = ThreadPool::new(1, parker::small());
+        let pool = ThreadPoolBuilder::new().build(1, parker::small());
         let latch2 = latch.clone();
         let latch3 = latch.clone();
         pool.execute(move || {
@@ -1381,7 +1384,7 @@ mod tests {
         let _ = env_logger::try_init();
 
         let latch = Arc::new(CountdownEvent::new(2));
-        let pool = ThreadPool::new(1, parker::small());
+        let pool = ThreadPoolBuilder::new().build(1, parker::small());
         let pool2 = pool.clone();
         let latch2 = latch.clone();
         let latch3 = latch.clone();
@@ -1423,7 +1426,7 @@ mod tests {
     fn shutdown_from_worker() {
         let _ = env_logger::try_init();
 
-        let pool = ThreadPool::new(1, parker::small());
+        let pool = ThreadPoolBuilder::new().build(1, parker::small());
         let pool2 = pool.clone();
         let latch = Arc::new(CountdownEvent::new(2));
         let latch2 = latch.clone();
@@ -1451,7 +1454,7 @@ mod tests {
     fn shutdown_external() {
         let _ = env_logger::try_init();
 
-        let pool = ThreadPool::new(1, parker::small());
+        let pool = ThreadPoolBuilder::new().build(1, parker::small());
         let pool2 = pool.clone();
         let run_latch = Arc::new(CountdownEvent::new(1));
         let stop_latch = Arc::new(CountdownEvent::new(1));
@@ -1478,7 +1481,7 @@ mod tests {
     fn dealloc_on_handle_drop() {
         let _ = env_logger::try_init();
 
-        let pool = ThreadPool::new(1, parker::small());
+        let pool = ThreadPoolBuilder::new().build(1, parker::small());
         let latch = Arc::new(CountdownEvent::new(1));
         let latch2 = latch.clone();
         pool.execute(move || {
